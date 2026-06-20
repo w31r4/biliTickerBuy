@@ -16,6 +16,7 @@ from util.request.BrowerState import (
     generate_browser_fingerprint_state,
 )
 from util.request.CookieManager import CookieManager
+from util.request.ErrorSidecar import BiliRequestErrorSidecar
 from util.request.exceptions import BiliConnectionError, BiliRateLimitError
 from util.proxy.ProxyManager import ProxyManager
 
@@ -54,6 +55,7 @@ class BiliRequest:
         self.proxy_manager.apply_to_session(self.session)
         self._h2_client = None
         self._bili_sec_token_cache: str | None = None
+        self._error_sidecar = BiliRequestErrorSidecar()
         self.createTime = int(time.time() * 1000)
 
     def _rotate_proxy(self, reason: str) -> bool:
@@ -225,6 +227,16 @@ class BiliRequest:
             except httpx.TimeoutException as exc:
                 self._invalidate_h2_client()
                 if attempt >= 1:
+                    self._record_request_exception(
+                        "h2_timeout",
+                        method,
+                        url,
+                        data=data,
+                        isJson=isJson,
+                        headers=headers,
+                        exc=exc,
+                        attempt=attempt + 1,
+                    )
                     raise BiliConnectionError(
                         "网络请求超时：服务器响应过慢，请稍后重试",
                         cause=exc,
@@ -233,6 +245,16 @@ class BiliRequest:
             except httpx.LocalProtocolError as exc:
                 self._invalidate_h2_client()
                 if attempt >= 1:
+                    self._record_request_exception(
+                        "h2_protocol_error",
+                        method,
+                        url,
+                        data=data,
+                        isJson=isJson,
+                        headers=headers,
+                        exc=exc,
+                        attempt=attempt + 1,
+                    )
                     raise BiliConnectionError(
                         "网络连接异常：HTTP/2 连接已断开，重试后仍失败，请稍后再试",
                         cause=exc,
@@ -415,6 +437,56 @@ class BiliRequest:
             isJson=isJson,
         )
 
+    def _request_headers_snapshot(self, headers=None) -> dict:
+        request_headers = dict(self.headers)
+        if headers:
+            request_headers.update(headers)
+        return request_headers
+
+    def _record_error_response(
+        self,
+        stage: str,
+        response,
+        method: str,
+        url,
+        *,
+        data=None,
+        isJson=False,
+        headers=None,
+    ) -> None:
+        self._error_sidecar.record_response(
+            stage=stage,
+            method=method,
+            url=str(url),
+            data=data,
+            is_json=isJson,
+            request_headers=self._request_headers_snapshot(headers),
+            response=response,
+        )
+
+    def _record_request_exception(
+        self,
+        stage: str,
+        method: str,
+        url,
+        *,
+        data=None,
+        isJson=False,
+        headers=None,
+        exc: BaseException,
+        attempt: int,
+    ) -> None:
+        self._error_sidecar.record_exception(
+            stage=stage,
+            method=method,
+            url=str(url),
+            data=data,
+            is_json=isJson,
+            request_headers=self._request_headers_snapshot(headers),
+            exc=exc,
+            attempt=attempt,
+        )
+
     def _request(self, method: str, url, data=None, isJson=False):
         response = self._send_with_h2_recovery(
             method,
@@ -422,8 +494,18 @@ class BiliRequest:
             data=data,
             isJson=isJson,
         )
+        if response.status_code >= 400:
+            self._record_error_response(
+                "initial_response",
+                response,
+                method,
+                url,
+                data=data,
+                isJson=isJson,
+            )
 
         if response.status_code == 412:
+            initial_response = response
             recovered = self._recover_from_bili_412(
                 response,
                 method,
@@ -433,6 +515,15 @@ class BiliRequest:
             )
             if recovered is not None:
                 response = recovered
+                if response is not initial_response and response.status_code >= 400:
+                    self._record_error_response(
+                        "recovered_response",
+                        response,
+                        method,
+                        url,
+                        data=data,
+                        isJson=isJson,
+                    )
             if response.status_code == 412:
                 self.request_count += 1
                 return response
